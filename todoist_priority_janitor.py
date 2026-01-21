@@ -90,28 +90,36 @@ class TodoistClient:
         return r.json()
 
 
-def parse_due_to_local(due_obj: Dict[str, Any], tz: dt.tzinfo) -> Tuple[Optional[dt.datetime], Optional[dt.date]]:
+def parse_due_to_local(due_obj: dict, tz: dt.tzinfo):
     """
-    Todoist due object commonly contains:
-      - {"date": "YYYY-MM-DD"} for all-day
-      - {"datetime": "RFC3339"} for timed
-    We'll return (due_dt_local, due_date_local).
+    Handles Todoist oddities:
+    - due["date"] may be YYYY-MM-DD OR full datetime
+    - due["datetime"] may or may not exist
     """
     if not due_obj:
         return None, None
 
+    # Prefer explicit datetime if present
     if due_obj.get("datetime"):
-        # Example: "2026-01-20T15:00:00Z" or with offset
         iso = due_obj["datetime"]
         due_dt = dt.datetime.fromisoformat(iso.replace("Z", "+00:00"))
         due_dt_local = due_dt.astimezone(tz)
         return due_dt_local, due_dt_local.date()
 
-    if due_obj.get("date"):
-        d = dt.date.fromisoformat(due_obj["date"])
-        return None, d
+    raw = due_obj.get("date")
+    if not raw:
+        return None, None
 
-    return None, None
+    # If date field actually contains a datetime
+    if "T" in raw:
+        due_dt = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        due_dt_local = due_dt.astimezone(tz)
+        return due_dt_local, due_dt_local.date()
+
+    # True date-only
+    d = dt.date.fromisoformat(raw)
+    return None, d
+
 
 
 def is_overdue(task: Dict[str, Any], now_local: dt.datetime, today_local: dt.date, tz: dt.tzinfo) -> bool:
