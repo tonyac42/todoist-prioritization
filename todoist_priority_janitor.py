@@ -1,310 +1,269 @@
 #!/usr/bin/env python3
-"""
-Todoist Priority Janitor (REST v2 + Sync v9)
-
-Todoist UI terms used below:
-- UI Priority 1 is the most urgent.
-- In the REST API, priority is 4 (most urgent) -> 1 (least).
-
-Rules:
-1) All overdue tasks => UI Priority 1
-2) All completed (checked) tasks => clear priority to default (UI P4) but keep labels
-3) If NO tasks are currently UI Priority 1, then after 12:05 (America/New_York):
-     - for tasks due today only:
-       UI P4 -> UI P3, UI P3 -> UI P2, UI P2 -> UI P1
-4) Create a UI Priority 1 task if GitHub Actions scheduling may stop soon
-   (scheduled workflows can be disabled after long repo inactivity).
-"""
+from __future__ import annotations
 
 import os
 import sys
 import json
 import uuid
+import datetime as dt
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
 import requests
-from datetime import datetime, timedelta, date
-from zoneinfo import ZoneInfo
 
-TZ = ZoneInfo(os.getenv("LOCAL_TZ", "America/New_York"))
-
-# REST v2 for active tasks
-TODOIST_REST_BASE = "https://api.todoist.com/rest/v2"
-# Sync v9 for completed items + item_update
-TODOIST_SYNC_BASE = "https://api.todoist.com/sync/v9"
-
-# Map Todoist UI priorities to API priorities
-# UI P1 -> API 4, UI P2 -> API 3, UI P3 -> API 2, UI P4 -> API 1
-UI_TO_API = {1: 4, 2: 3, 3: 2, 4: 1}
-API_TO_UI = {v: k for k, v in UI_TO_API.items()}
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None  # type: ignore
 
 
-def die(msg: str, code: int = 1) -> None:
-    print(f"ERROR: {msg}", file=sys.stderr)
-    sys.exit(code)
+API_BASE = "https://api.todoist.com/api/v1"
 
 
-def rest_headers(token: str) -> dict:
-    return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+@dataclass
+class TodoistClient:
+    token: str
+
+    def _headers(self) -> Dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.token}",
+            "Content-Type": "application/json",
+        }
+
+    def get_all_active_tasks(self, limit: int = 200) -> List[Dict[str, Any]]:
+        """
+        GET /api/v1/tasks (paginated; cursor-based)
+        Returns a flat list of active tasks.
+        """
+        tasks: List[Dict[str, Any]] = []
+        cursor: Optional[str] = None
+
+        while True:
+            params: Dict[str, Any] = {"limit": limit}
+            if cursor:
+                params["cursor"] = cursor
+
+            r = requests.get(f"{API_BASE}/tasks", headers=self._headers(), params=params, timeout=30)
+            r.raise_for_status()
+            payload = r.json()
+
+            # API returns: { "results": [...], "next_cursor": "..." }
+            page = payload.get("results", [])
+            tasks.extend(page)
+
+            cursor = payload.get("next_cursor")
+            if not cursor:
+                break
+
+        return tasks
+
+    def update_task_priority(self, task_id: str, priority: int) -> None:
+        """
+        POST /api/v1/tasks/{task_id} with {"priority": N}
+        """
+        if priority < 1 or priority > 4:
+            raise ValueError("priority must be between 1 and 4")
+
+        r = requests.post(
+            f"{API_BASE}/tasks/{task_id}",
+            headers=self._headers(),
+            data=json.dumps({"priority": priority}),
+            timeout=30,
+        )
+        r.raise_for_status()
+
+    def create_task(self, content: str, priority: int = 4, due_string: Optional[str] = None) -> Dict[str, Any]:
+        """
+        POST /api/v1/tasks
+        """
+        body: Dict[str, Any] = {"content": content, "priority": priority}
+        if due_string:
+            body["due_string"] = due_string
+
+        r = requests.post(
+            f"{API_BASE}/tasks",
+            headers=self._headers(),
+            data=json.dumps(body),
+            timeout=30,
+        )
+        r.raise_for_status()
+        return r.json()
 
 
-def sync_headers(token: str) -> dict:
-    return {"Authorization": f"Bearer {token}", "Content-Type": "application/x-www-form-urlencoded"}
+def parse_due_to_local(due_obj: Dict[str, Any], tz: dt.tzinfo) -> Tuple[Optional[dt.datetime], Optional[dt.date]]:
+    """
+    Todoist due object commonly contains:
+      - {"date": "YYYY-MM-DD"} for all-day
+      - {"datetime": "RFC3339"} for timed
+    We'll return (due_dt_local, due_date_local).
+    """
+    if not due_obj:
+        return None, None
+
+    if due_obj.get("datetime"):
+        # Example: "2026-01-20T15:00:00Z" or with offset
+        iso = due_obj["datetime"]
+        due_dt = dt.datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        due_dt_local = due_dt.astimezone(tz)
+        return due_dt_local, due_dt_local.date()
+
+    if due_obj.get("date"):
+        d = dt.date.fromisoformat(due_obj["date"])
+        return None, d
+
+    return None, None
 
 
-def get_active_tasks(token: str) -> list[dict]:
-    r = requests.get(f"{TODOIST_REST_BASE}/tasks", headers=rest_headers(token), timeout=30)
-    r.raise_for_status()
-    return r.json()
+def is_overdue(task: Dict[str, Any], now_local: dt.datetime, today_local: dt.date, tz: dt.tzinfo) -> bool:
+    due = task.get("due") or {}
+    due_dt_local, due_date_local = parse_due_to_local(due, tz)
 
-
-def update_task_priority_rest(token: str, task_id: str, api_priority: int) -> None:
-    r = requests.post(
-        f"{TODOIST_REST_BASE}/tasks/{task_id}",
-        headers=rest_headers(token),
-        data=json.dumps({"priority": int(api_priority)}),
-        timeout=30,
-    )
-    r.raise_for_status()
-
-
-def create_task_rest(
-    token: str,
-    content: str,
-    api_priority: int,
-    due_date: str | None = None,      # YYYY-MM-DD
-    project_id: str | None = None,
-    description: str | None = None,
-    labels: list[str] | None = None,  # REST v2 uses label NAMES in "labels"
-) -> dict:
-    payload: dict = {"content": content, "priority": int(api_priority)}
-    if due_date:
-        payload["due_date"] = due_date
-    if project_id:
-        payload["project_id"] = project_id
-    if description:
-        payload["description"] = description
-    if labels:
-        payload["labels"] = labels
-
-    r = requests.post(
-        f"{TODOIST_REST_BASE}/tasks",
-        headers=rest_headers(token),
-        data=json.dumps(payload),
-        timeout=30,
-    )
-    r.raise_for_status()
-    return r.json()
-
-
-def sync_completed_get_all(token: str, since_iso: str, limit: int = 200) -> list[dict]:
-    params = {"since": since_iso, "limit": str(limit), "annotate_items": "true"}
-    r = requests.get(
-        f"{TODOIST_SYNC_BASE}/completed/get_all",
-        headers={"Authorization": f"Bearer {token}"},
-        params=params,
-        timeout=30,
-    )
-    r.raise_for_status()
-    return r.json().get("items", [])
-
-
-def sync_item_update_priority(token: str, item_id: str, api_priority: int) -> None:
-    cmd_uuid = str(uuid.uuid4())
-    commands = [{
-        "type": "item_update",
-        "uuid": cmd_uuid,
-        "args": {"id": str(item_id), "priority": int(api_priority)},
-    }]
-
-    r = requests.post(
-        f"{TODOIST_SYNC_BASE}/sync",
-        headers=sync_headers(token),
-        data={"commands": json.dumps(commands)},
-        timeout=30,
-    )
-    r.raise_for_status()
-    out = r.json()
-    status = out.get("sync_status", {}).get(cmd_uuid)
-    if status != "ok":
-        print(f"Warn: item_update not ok for item {item_id}: {status}")
-
-
-def is_overdue(task: dict, today_local: date) -> bool:
-    due = task.get("due")
-    if not due:
+    if due_date_local is None:
         return False
 
-    # Date-only due
-    if due.get("date"):
-        try:
-            d = date.fromisoformat(due["date"])
-            return d < today_local
-        except ValueError:
-            return False
-
-    # Datetime due
-    dt_str = due.get("datetime")
-    if dt_str:
-        try:
-            dt_utc = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
-            return dt_utc.astimezone(TZ) < datetime.now(TZ)
-        except Exception:
-            return False
-
-    return False
+    if due_dt_local is not None:
+        return due_dt_local < now_local
+    else:
+        return due_date_local < today_local
 
 
-def is_due_today(task: dict, today_local: date) -> bool:
-    due = task.get("due")
-    if not due:
-        return False
-
-    if due.get("date"):
-        try:
-            return date.fromisoformat(due["date"]) == today_local
-        except ValueError:
-            return False
-
-    dt_str = due.get("datetime")
-    if dt_str:
-        try:
-            dt_utc = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
-            return dt_utc.astimezone(TZ).date() == today_local
-        except Exception:
-            return False
-
-    return False
+def is_due_today(task: Dict[str, Any], today_local: dt.date, tz: dt.tzinfo) -> bool:
+    due = task.get("due") or {}
+    _, due_date_local = parse_due_to_local(due, tz)
+    return (due_date_local == today_local)
 
 
-def github_inactivity_days() -> int | None:
-    repo = os.getenv("GITHUB_REPOSITORY")
-    token = os.getenv("GITHUB_TOKEN")
-    if not repo or not token:
-        return None
-
-    r = requests.get(
-        f"https://api.github.com/repos/{repo}",
-        headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
-        timeout=30,
-    )
-    if r.status_code >= 400:
-        print(f"Warn: GitHub API failed: {r.status_code} {r.text[:200]}")
-        return None
-
-    pushed_at = r.json().get("pushed_at")
-    if not pushed_at:
-        return None
-
-    dt = datetime.fromisoformat(pushed_at.replace("Z", "+00:00")).astimezone(TZ)
-    return max((datetime.now(TZ).date() - dt.date()).days, 0)
+def get_local_tz() -> dt.tzinfo:
+    """
+    Uses TZ env var if set (recommended), else falls back to America/New_York.
+    """
+    tz_name = os.getenv("TZ", "America/New_York")
+    if ZoneInfo is None:
+        # Worst-case fallback: naive local time
+        return dt.timezone(dt.timedelta(hours=-5))
+    return ZoneInfo(tz_name)
 
 
-def maybe_create_github_expiry_warning(todoist_token: str, active_tasks: list[dict]) -> None:
-    warn_days = int(os.getenv("GH_WARN_DAYS", "55"))
-    disable_days = int(os.getenv("GH_DISABLE_DAYS", "60"))
-    inactivity = github_inactivity_days()
-    if inactivity is None:
-        return
-    if not (warn_days <= inactivity < disable_days):
+def after_1205(now_local: dt.datetime) -> bool:
+    return (now_local.hour, now_local.minute) >= (12, 5)
+
+
+def cascade_priorities_for_today(tasks_due_today: List[Dict[str, Any]]) -> Dict[int, int]:
+    """
+    Compress priority levels for tasks due today (only when there are no P1 tasks globally).
+    Example sets:
+      {2} -> {1}
+      {3} -> {1}
+      {4} -> {1}
+      {2,4} -> {1,2}   (so P4 -> P2)
+      {3,4} -> {1,2}
+      {2,3,4} -> {1,2,3}
+    Returns a mapping old_priority -> new_priority
+    """
+    levels = sorted({t.get("priority") for t in tasks_due_today if t.get("priority") in (2, 3, 4)})
+    mapping: Dict[int, int] = {}
+    for i, lvl in enumerate(levels, start=1):
+        mapping[lvl] = i  # compress to 1..N
+    return mapping
+
+
+def ensure_monthly_github_keepalive_task(client: TodoistClient, active_tasks: List[Dict[str, Any]], today_local: dt.date) -> None:
+    """
+    Creates a P1 task on the 1st of each month if one doesn't already exist today.
+    This is your “sign in / keep Actions alive” reminder.
+    """
+    if today_local.day != 1:
         return
 
-    marker = os.getenv("GH_TASK_MARKER", "[GH-ACTIONS-KEEPALIVE]")
-    if any(marker in (t.get("content") or "") for t in active_tasks):
+    repo = os.getenv("GITHUB_REPOSITORY", "").strip()
+    if repo:
+        actions_url = f"https://github.com/{repo}/actions"
+    else:
+        actions_url = "https://github.com/ (open your repo → Actions)"
+
+    marker = "Todoist Priority Janitor — GitHub Actions keepalive"
+    already = any(
+        (marker in (t.get("content") or "")) and (t.get("priority") == 1) and (t.get("due") and (t["due"].get("date") == today_local.isoformat()))
+        for t in active_tasks
+    )
+    if already:
         return
 
-    repo = os.getenv("GITHUB_REPOSITORY", "")
-    actions_url = f"https://github.com/{repo}/actions" if repo else "https://github.com"
-    today_str = datetime.now(TZ).date().isoformat()
-
-    content = f"{marker} GitHub Actions may stop soon — sign in and run/refresh it"
-    description = (
-        f"Repo inactivity is ~{inactivity} days.\n\n"
-        f"Link: {actions_url}\n\n"
-        "Reminder: you may need to sign in and manually run the workflow or push a small commit."
+    content = (
+        f"{marker}\n"
+        f"Sign in and re-run workflow if needed.\n"
+        f"{actions_url}"
     )
-
-    create_task_rest(
-        todoist_token,
-        content=content,
-        api_priority=UI_TO_API[1],
-        due_date=today_str,
-        project_id=os.getenv("TODOIST_PROJECT_ID") or None,
-        description=description,
-    )
-    print(f"Created GitHub expiry warning task (inactivity={inactivity} days).")
+    # due_string "today" is fine; Todoist will interpret in account timezone
+    client.create_task(content=content, priority=1, due_string="today")
 
 
-def main() -> None:
-    todoist_token = os.getenv("TODOIST_TOKEN")
-    if not todoist_token:
-        die("Missing TODOIST_TOKEN secret/env var")
+def main() -> int:
+    token = os.getenv("TODOIST_TOKEN", "").strip()
+    if not token:
+        print("ERROR: Missing TODOIST_TOKEN env var (set it as a GitHub Actions secret).")
+        return 2
 
-    now = datetime.now(TZ)
-    today_local = now.date()
+    tz = get_local_tz()
+    now_local = dt.datetime.now(tz)
+    today_local = now_local.date()
 
-    # Fetch active tasks
-    active = get_active_tasks(todoist_token)
+    client = TodoistClient(token=token)
 
-    # Rule 1: overdue -> UI P1
+    # 1) Fetch tasks
+    active = client.get_all_active_tasks()
+
+    # 4) Monthly reminder task (do this early so it can participate in “P1 exists?”)
+    ensure_monthly_github_keepalive_task(client, active, today_local)
+    # refresh list in case we just created one
+    active = client.get_all_active_tasks()
+
+    # 2) Overdue => P1
+    updates: List[Tuple[str, int, int]] = []  # (task_id, old, new)
+
     for t in active:
-        if is_overdue(t, today_local):
-            cur_api = int(t.get("priority") or UI_TO_API[4])
-            if cur_api != UI_TO_API[1]:
-                update_task_priority_rest(todoist_token, str(t["id"]), UI_TO_API[1])
-                print(f"Overdue -> P1: {t['id']} {(t.get('content') or '')[:60]}")
-
-    # Refresh
-    active = get_active_tasks(todoist_token)
-
-    # Rule 2: completed -> clear priority (to default UI P4)
-    lookback_hours = int(os.getenv("COMPLETED_LOOKBACK_HOURS", "24"))
-    since_iso = (now - timedelta(hours=lookback_hours)).astimezone(ZoneInfo("UTC")).isoformat(timespec="seconds")
-
-    completed_items = sync_completed_get_all(todoist_token, since_iso=since_iso, limit=200)
-    for entry in completed_items:
-        item_obj = entry.get("item_object") or {}
-        item_id = item_obj.get("id") or entry.get("task_id")
-        if not item_id:
+        if not (t.get("due")):
             continue
-        sync_item_update_priority(todoist_token, str(item_id), UI_TO_API[4])
+        if is_overdue(t, now_local, today_local, tz):
+            if t.get("priority") != 1:
+                updates.append((t["id"], t.get("priority", 4), 1))
 
-    print(f"Processed completed items (lookback {lookback_hours}h): {len(completed_items)}")
+    # 3) Checked => clear priority (P4), labels untouched
+    for t in active:
+        if t.get("checked") is True:
+            if t.get("priority") != 4:
+                updates.append((t["id"], t.get("priority", 4), 4))
 
-    # Refresh
-    active = get_active_tasks(todoist_token)
+    # Apply overdue/checked updates first
+    if updates:
+        # de-dup: last write wins per task_id
+        last: Dict[str, Tuple[int, int]] = {}
+        for task_id, oldp, newp in updates:
+            last[task_id] = (oldp, newp)
 
-    # Rule 3: noon escalation if no UI P1 tasks exist
-    has_ui_p1 = any(int(t.get("priority") or UI_TO_API[4]) == UI_TO_API[1] for t in active)
-    after_1205 = (now.hour > 12) or (now.hour == 12 and now.minute >= 5)
+        for task_id, (_oldp, newp) in last.items():
+            client.update_task_priority(task_id, newp)
 
-    if (not has_ui_p1) and after_1205:
-        for t in active:
-            if not is_due_today(t, today_local):
-                continue
+        # refresh after updates
+        active = client.get_all_active_tasks()
 
-            api_pri = int(t.get("priority") or UI_TO_API[4])
-            ui_pri = API_TO_UI.get(api_pri, 4)
+    # 4) Cascading: only if NO P1 tasks exist, and only after 12:05 local, and only for due-today tasks
+    any_p1 = any((t.get("priority") == 1) for t in active)
+    if (not any_p1) and after_1205(now_local):
+        due_today = [t for t in active if (t.get("due") and is_due_today(t, today_local, tz) and not (t.get("checked") is True))]
+        mapping = cascade_priorities_for_today(due_today)
 
-            if ui_pri in (2, 3, 4):
-                new_ui = ui_pri - 1
-                new_api = UI_TO_API[new_ui]
-                if new_api != api_pri:
-                    update_task_priority_rest(todoist_token, str(t["id"]), new_api)
-                    print(f"Escalated due-today: {t['id']} UI P{ui_pri} -> UI P{new_ui}")
+        if mapping:
+            for t in due_today:
+                oldp = t.get("priority")
+                if oldp in mapping:
+                    newp = mapping[oldp]
+                    if newp != oldp:
+                        client.update_task_priority(t["id"], newp)
 
-    # Rule 4: GitHub warning task
-    maybe_create_github_expiry_warning(todoist_token, active)
-
-    print("Done.")
+    print("OK")
+    return 0
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except requests.HTTPError as e:
-        text = ""
-        try:
-            text = (e.response.text or "")[:800]
-        except Exception:
-            pass
-        print(f"HTTPError: {e} :: {text}", file=sys.stderr)
-        raise
+    raise SystemExit(main())
