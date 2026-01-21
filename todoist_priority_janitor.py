@@ -4,9 +4,7 @@ from __future__ import annotations
 import os
 import sys
 import json
-import uuid
 import datetime as dt
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -17,12 +15,32 @@ except ImportError:
     ZoneInfo = None  # type: ignore
 
 
+# ===== Todoist API base (this is what you got green with) =====
 API_BASE = "https://api.todoist.com/api/v1"
 
+# ===== Priority mapping =====
+# Todoist UI: P1 (highest) ... P4 (lowest/default)
+# Todoist API (what we must send): 4 (highest) ... 1 (lowest/default)
+UI_TO_API = {1: 4, 2: 3, 3: 2, 4: 1}
+API_TO_UI = {4: 1, 3: 2, 2: 3, 1: 4}
 
-@dataclass
+
+def die(msg: str, code: int = 2) -> None:
+    print(f"ERROR: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def get_local_tz() -> dt.tzinfo:
+    tz_name = os.getenv("TZ", "America/New_York")
+    if ZoneInfo is None:
+        # fallback if zoneinfo isn't available
+        return dt.timezone(dt.timedelta(hours=-5))
+    return ZoneInfo(tz_name)
+
+
 class TodoistClient:
-    token: str
+    def __init__(self, token: str):
+        self.token = token
 
     def _headers(self) -> Dict[str, str]:
         return {
@@ -32,8 +50,7 @@ class TodoistClient:
 
     def get_all_active_tasks(self, limit: int = 200) -> List[Dict[str, Any]]:
         """
-        GET /api/v1/tasks (paginated; cursor-based)
-        Returns a flat list of active tasks.
+        GET /api/v1/tasks (cursor pagination)
         """
         tasks: List[Dict[str, Any]] = []
         cursor: Optional[str] = None
@@ -47,36 +64,30 @@ class TodoistClient:
             r.raise_for_status()
             payload = r.json()
 
-            # API returns: { "results": [...], "next_cursor": "..." }
-            page = payload.get("results", [])
-            tasks.extend(page)
-
+            tasks.extend(payload.get("results", []))
             cursor = payload.get("next_cursor")
             if not cursor:
                 break
 
         return tasks
 
-    def update_task_priority(self, task_id: str, priority: int) -> None:
+    def update_task_priority(self, task_id: str, api_priority: int) -> None:
         """
-        POST /api/v1/tasks/{task_id} with {"priority": N}
+        POST /api/v1/tasks/{task_id}
         """
-        if priority < 1 or priority > 4:
-            raise ValueError("priority must be between 1 and 4")
-
         r = requests.post(
             f"{API_BASE}/tasks/{task_id}",
             headers=self._headers(),
-            data=json.dumps({"priority": priority}),
+            data=json.dumps({"priority": int(api_priority)}),
             timeout=30,
         )
         r.raise_for_status()
 
-    def create_task(self, content: str, priority: int = 4, due_string: Optional[str] = None) -> Dict[str, Any]:
+    def create_task(self, content: str, api_priority: int = 1, due_string: Optional[str] = None) -> Dict[str, Any]:
         """
         POST /api/v1/tasks
         """
-        body: Dict[str, Any] = {"content": content, "priority": priority}
+        body: Dict[str, Any] = {"content": content, "priority": int(api_priority)}
         if due_string:
             body["due_string"] = due_string
 
@@ -90,18 +101,20 @@ class TodoistClient:
         return r.json()
 
 
-def parse_due_to_local(due_obj: dict, tz: dt.tzinfo):
+def parse_due_to_local(due_obj: Dict[str, Any], tz: dt.tzinfo) -> Tuple[Optional[dt.datetime], Optional[dt.date]]:
     """
-    Handles Todoist oddities:
-    - due["date"] may be YYYY-MM-DD OR full datetime
-    - due["datetime"] may or may not exist
+    Todoist due object variants we handle:
+      - {"date": "YYYY-MM-DD"} (all-day)
+      - {"datetime": "YYYY-MM-DDTHH:MM:SSZ"} (timed)
+      - sometimes weirdly: {"date": "YYYY-MM-DDTHH:MM:SS"} (datetime stuffed in date field)
+    Returns (due_dt_local_or_None, due_date_local_or_None)
     """
     if not due_obj:
         return None, None
 
-    # Prefer explicit datetime if present
+    # Prefer explicit datetime
     if due_obj.get("datetime"):
-        iso = due_obj["datetime"]
+        iso = str(due_obj["datetime"])
         due_dt = dt.datetime.fromisoformat(iso.replace("Z", "+00:00"))
         due_dt_local = due_dt.astimezone(tz)
         return due_dt_local, due_dt_local.date()
@@ -110,16 +123,17 @@ def parse_due_to_local(due_obj: dict, tz: dt.tzinfo):
     if not raw:
         return None, None
 
-    # If date field actually contains a datetime
+    raw = str(raw)
+
+    # If "date" actually contains a datetime
     if "T" in raw:
         due_dt = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        due_dt_local = due_dt.astimezone(tz)
+        due_dt_local = due_dt.astimezone(tz) if due_dt.tzinfo else due_dt.replace(tzinfo=tz)
         return due_dt_local, due_dt_local.date()
 
     # True date-only
     d = dt.date.fromisoformat(raw)
     return None, d
-
 
 
 def is_overdue(task: Dict[str, Any], now_local: dt.datetime, today_local: dt.date, tz: dt.tzinfo) -> bool:
@@ -129,145 +143,175 @@ def is_overdue(task: Dict[str, Any], now_local: dt.datetime, today_local: dt.dat
     if due_date_local is None:
         return False
 
+    # If timed, overdue if datetime has passed
     if due_dt_local is not None:
         return due_dt_local < now_local
-    else:
-        return due_date_local < today_local
+
+    # If date-only, overdue if date is before today
+    return due_date_local < today_local
 
 
 def is_due_today(task: Dict[str, Any], today_local: dt.date, tz: dt.tzinfo) -> bool:
     due = task.get("due") or {}
     _, due_date_local = parse_due_to_local(due, tz)
-    return (due_date_local == today_local)
-
-
-def get_local_tz() -> dt.tzinfo:
-    """
-    Uses TZ env var if set (recommended), else falls back to America/New_York.
-    """
-    tz_name = os.getenv("TZ", "America/New_York")
-    if ZoneInfo is None:
-        # Worst-case fallback: naive local time
-        return dt.timezone(dt.timedelta(hours=-5))
-    return ZoneInfo(tz_name)
+    return due_date_local == today_local
 
 
 def after_1205(now_local: dt.datetime) -> bool:
     return (now_local.hour, now_local.minute) >= (12, 5)
 
 
-def cascade_priorities_for_today(tasks_due_today: List[Dict[str, Any]]) -> Dict[int, int]:
+def compress_due_today_priorities_api(tasks_due_today: List[Dict[str, Any]]) -> Dict[int, int]:
     """
-    Compress priority levels for tasks due today (only when there are no P1 tasks globally).
-    Example sets:
-      {2} -> {1}
-      {3} -> {1}
-      {4} -> {1}
-      {2,4} -> {1,2}   (so P4 -> P2)
-      {3,4} -> {1,2}
-      {2,3,4} -> {1,2,3}
-    Returns a mapping old_priority -> new_priority
+    Implements your cascading rule exactly by "gap-compressing" the UI priorities among tasks due today,
+    but ONLY for UI P2/P3/P4 (since we only run this step when there are no P1 tasks currently).
+
+    Example:
+      Due today contains UI {P3,P4}  -> becomes UI {P1,P2}
+      Due today contains UI {P4}     -> becomes UI {P1}
+      Due today contains UI {P2,P4}  -> becomes UI {P1,P2}  (P4 jumps to P2 because no P3)
+    Returns mapping in API priority numbers: old_api_priority -> new_api_priority
     """
-    levels = sorted({t.get("priority") for t in tasks_due_today if t.get("priority") in (2, 3, 4)})
-    mapping: Dict[int, int] = {}
-    for i, lvl in enumerate(levels, start=1):
-        mapping[lvl] = i  # compress to 1..N
-    return mapping
+    # Consider only tasks currently at API 1/2/3 (UI P4/P3/P2). Ignore API 4 (UI P1).
+    present_api_levels = sorted({t.get("priority") for t in tasks_due_today if t.get("priority") in (1, 2, 3)})
+
+    # Convert to UI for clarity, then compress UI values down to 1..N (no gaps)
+    present_ui_levels = sorted({API_TO_UI[a] for a in present_api_levels})  # values in {2,3,4}
+    ui_map = {old_ui: new_ui for new_ui, old_ui in enumerate(present_ui_levels, start=1)}  # compress to {1..N}
+
+    # Convert UI mapping back to API priorities
+    api_map: Dict[int, int] = {}
+    for old_ui, new_ui in ui_map.items():
+        old_api = UI_TO_API[old_ui]
+        new_api = UI_TO_API[new_ui]
+        api_map[old_api] = new_api
+
+    return api_map
 
 
-def ensure_monthly_github_keepalive_task(client: TodoistClient, active_tasks: List[Dict[str, Any]], today_local: dt.date) -> None:
+def github_inactivity_days() -> Optional[int]:
     """
-    Creates a P1 task on the 1st of each month if one doesn't already exist today.
-    This is your “sign in / keep Actions alive” reminder.
+    Uses GitHub API to get repo pushed_at and compute inactivity days.
+    Only works in GitHub Actions where GITHUB_REPOSITORY and GITHUB_TOKEN exist.
     """
-    if today_local.day != 1:
+    repo = os.getenv("GITHUB_REPOSITORY", "").strip()
+    token = os.getenv("GITHUB_TOKEN", "").strip()
+    if not repo or not token:
+        return None
+
+    r = requests.get(
+        f"https://api.github.com/repos/{repo}",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+        timeout=30,
+    )
+    if r.status_code >= 400:
+        return None
+
+    pushed_at = r.json().get("pushed_at")
+    if not pushed_at:
+        return None
+
+    # pushed_at is ISO8601 UTC
+    pushed_dt = dt.datetime.fromisoformat(pushed_at.replace("Z", "+00:00"))
+    days = (dt.datetime.now(dt.timezone.utc).date() - pushed_dt.date()).days
+    return max(days, 0)
+
+
+def maybe_create_github_expiry_task(client: TodoistClient, active_tasks: List[Dict[str, Any]]) -> None:
+    """
+    Creates a UI P1 task (API priority 4) when repo inactivity is in [warn_days, disable_days),
+    with link + sign-in reminder. Creates at most one such task at a time (marker-based).
+    """
+    warn_days = int(os.getenv("GH_WARN_DAYS", "55"))
+    disable_days = int(os.getenv("GH_DISABLE_DAYS", "60"))
+    inactivity = github_inactivity_days()
+    if inactivity is None:
+        return
+    if not (warn_days <= inactivity < disable_days):
         return
 
-    repo = os.getenv("GITHUB_REPOSITORY", "").strip()
-    if repo:
-        actions_url = f"https://github.com/{repo}/actions"
-    else:
-        actions_url = "https://github.com/ (open your repo → Actions)"
-
-    marker = "Todoist Priority Janitor — GitHub Actions keepalive"
-    already = any(
-        (marker in (t.get("content") or "")) and (t.get("priority") == 1) and (t.get("due") and (t["due"].get("date") == today_local.isoformat()))
-        for t in active_tasks
-    )
+    marker = os.getenv("GH_TASK_MARKER", "[GH-ACTIONS-KEEPALIVE]").strip()
+    already = any(marker in (t.get("content") or "") for t in active_tasks)
     if already:
         return
 
+    repo = os.getenv("GITHUB_REPOSITORY", "").strip()
+    actions_url = f"https://github.com/{repo}/actions" if repo else "https://github.com (open your repo → Actions)"
+
     content = (
-        f"{marker}\n"
-        f"Sign in and re-run workflow if needed.\n"
+        f"{marker} GitHub Actions may stop soon — sign in and run/refresh\n"
+        f"Inactivity: ~{inactivity} days\n"
         f"{actions_url}"
     )
-    # due_string "today" is fine; Todoist will interpret in account timezone
-    client.create_task(content=content, priority=1, due_string="today")
+
+    # Create as UI P1 => API 4
+    client.create_task(content=content, api_priority=UI_TO_API[1], due_string="today")
 
 
 def main() -> int:
     token = os.getenv("TODOIST_TOKEN", "").strip()
     if not token:
-        print("ERROR: Missing TODOIST_TOKEN env var (set it as a GitHub Actions secret).")
-        return 2
+        die("Missing TODOIST_TOKEN env var (set it as a GitHub Actions secret).")
 
     tz = get_local_tz()
     now_local = dt.datetime.now(tz)
     today_local = now_local.date()
 
-    client = TodoistClient(token=token)
+    client = TodoistClient(token)
 
-    # 1) Fetch tasks
+    # Load tasks
     active = client.get_all_active_tasks()
 
-    # 4) Monthly reminder task (do this early so it can participate in “P1 exists?”)
-    ensure_monthly_github_keepalive_task(client, active, today_local)
-    # refresh list in case we just created one
+    # GitHub expiry warning (optional but you asked for it)
+    maybe_create_github_expiry_task(client, active)
+
+    # Refresh tasks in case we created one
     active = client.get_all_active_tasks()
 
-    # 2) Overdue => P1
-    updates: List[Tuple[str, int, int]] = []  # (task_id, old, new)
+    # ---- Rule 1: Overdue tasks => UI P1 (API priority 4) ----
+    # ---- Rule 2: Checked tasks => clear priority to default (UI P4 = API 1), keep labels ----
+    # We'll compute desired priorities and apply only if changes are needed.
+    desired: Dict[str, int] = {}
 
     for t in active:
-        if not (t.get("due")):
-            continue
-        if is_overdue(t, now_local, today_local, tz):
-            if t.get("priority") != 1:
-                updates.append((t["id"], t.get("priority", 4), 1))
+        task_id = str(t.get("id"))
+        cur_api_pri = int(t.get("priority", 1))
 
-    # 3) Checked => clear priority (P4), labels untouched
-    for t in active:
+        # Rule 2: checked -> default
         if t.get("checked") is True:
-            if t.get("priority") != 4:
-                updates.append((t["id"], t.get("priority", 4), 4))
+            if cur_api_pri != UI_TO_API[4]:
+                desired[task_id] = UI_TO_API[4]
+            continue
 
-    # Apply overdue/checked updates first
-    if updates:
-        # de-dup: last write wins per task_id
-        last: Dict[str, Tuple[int, int]] = {}
-        for task_id, oldp, newp in updates:
-            last[task_id] = (oldp, newp)
+        # Rule 1: overdue -> P1
+        if t.get("due") and is_overdue(t, now_local, today_local, tz):
+            if cur_api_pri != UI_TO_API[1]:
+                desired[task_id] = UI_TO_API[1]
 
-        for task_id, (_oldp, newp) in last.items():
-            client.update_task_priority(task_id, newp)
+    # Apply overdue/checked changes
+    for task_id, new_api_pri in desired.items():
+        client.update_task_priority(task_id, new_api_pri)
 
-        # refresh after updates
-        active = client.get_all_active_tasks()
+    # Refresh after updates so Rule 3 sees current reality
+    active = client.get_all_active_tasks()
 
-    # 4) Cascading: only if NO P1 tasks exist, and only after 12:05 local, and only for due-today tasks
-    any_p1 = any((t.get("priority") == 1) for t in active)
-    if (not any_p1) and after_1205(now_local):
-        due_today = [t for t in active if (t.get("due") and is_due_today(t, today_local, tz) and not (t.get("checked") is True))]
-        mapping = cascade_priorities_for_today(due_today)
+    # ---- Rule 3: Cascading compression (due today only, after 12:05, only if no UI P1 tasks exist) ----
+    any_ui_p1_exists = any(int(t.get("priority", 1)) == UI_TO_API[1] for t in active)
 
+    if (not any_ui_p1_exists) and after_1205(now_local):
+        due_today = [
+            t for t in active
+            if (t.get("due") and is_due_today(t, today_local, tz) and not (t.get("checked") is True))
+        ]
+
+        mapping = compress_due_today_priorities_api(due_today)
         if mapping:
             for t in due_today:
-                oldp = t.get("priority")
-                if oldp in mapping:
-                    newp = mapping[oldp]
-                    if newp != oldp:
-                        client.update_task_priority(t["id"], newp)
+                old_api = int(t.get("priority", 1))
+                if old_api in mapping:
+                    new_api = mapping[old_api]
+                    if new_api != old_api:
+                        client.update_task_priority(str(t["id"]), new_api)
 
     print("OK")
     return 0
